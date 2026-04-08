@@ -332,16 +332,19 @@ def score_listing(listing):
         reasons.append("Laundry mentioned")
 
     # --- Pets ---
-    if any(kw in text for kw in PET_POSITIVE):
+    has_pet_positive = any(kw in text for kw in PET_POSITIVE)
+    has_pet_negative = any(kw in text for kw in PET_NEGATIVE)
+    if has_pet_positive:
         score += 10
         reasons.append("Cat/pet friendly")
-    elif any(kw in text for kw in PET_NEGATIVE):
+    elif has_pet_negative:
         score -= 20
         reasons.append("No pets allowed")
 
     # --- Classify ---
-    no_pets = any(kw in text for kw in PET_NEGATIVE)
-    if score >= 40 and not no_pets:
+    # "Cats OK" overrides a generic "No Pets" in the same listing
+    definitively_no_pets = has_pet_negative and not has_pet_positive
+    if score >= 40 and not definitively_no_pets:
         classification = "HOT"
     elif score >= 25:
         classification = "GOOD"
