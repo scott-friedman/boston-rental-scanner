@@ -19,7 +19,7 @@ TARGET_LON = -71.0872
 
 MAX_RENT = 2500
 MIN_BEDS = 1
-ZILLOW_INTERVAL_HOURS = 8
+ZILLOW_INTERVAL_HOURS = 24
 
 CL_SEARCH_URL = (
     "https://boston.craigslist.org/search/apa"
@@ -503,11 +503,8 @@ def main():
     for listing, score, classification, reasons in hot:
         notify_hot(listing, score, reasons)
 
-    if other:
-        notify_summary(other)
-
-    if not hot and not other:
-        print("No new matches — no notifications sent.")
+    if not hot:
+        print("No HOT matches — no notifications sent.")
 
     # Persist
     save_state(seen)
