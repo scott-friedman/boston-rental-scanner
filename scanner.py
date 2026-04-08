@@ -340,7 +340,8 @@ def score_listing(listing):
         reasons.append("No pets allowed")
 
     # --- Classify ---
-    if score >= 40:
+    no_pets = any(kw in text for kw in PET_NEGATIVE)
+    if score >= 40 and not no_pets:
         classification = "HOT"
     elif score >= 25:
         classification = "GOOD"
