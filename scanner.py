@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boston Rental Scanner — polls Craigslist RSS + Zillow API for matching rentals."""
+"""Boston Rental Scanner — polls Craigslist for matching rentals."""
 
 import json
 import math
@@ -16,16 +16,21 @@ import requests
 
 TARGET_LAT = 42.3467  # 1001 Boylston St
 TARGET_LON = -71.0872
+WALK_DISTANCE_MI = 1.0  # max walking distance to work
+STOP_RADIUS_MI = 0.3  # max distance from a Green Line stop
 
 MAX_RENT = 2500
 MIN_BEDS = 1
+
+# Zillow — disabled for now, set ENABLE_ZILLOW=1 to turn on
+ENABLE_ZILLOW = os.environ.get("ENABLE_ZILLOW", "") == "1"
 ZILLOW_INTERVAL_HOURS = 24
+ZILLOW_API_URL = "https://www.searchapi.io/api/v1/search"
 
 CL_SEARCH_URL = (
     "https://boston.craigslist.org/search/apa"
     "?max_price=2500&min_bedrooms=1"
 )
-ZILLOW_API_URL = "https://www.searchapi.io/api/v1/search"
 
 STATE_DIR = Path("state")
 SEEN_FILE = STATE_DIR / "seen.json"
@@ -35,23 +40,43 @@ SEARCHAPI_KEY = os.environ.get("SEARCHAPI_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# ── Neighborhoods ───────────────────────────────────────────────────────────
+# ── Green Line stops within ~15 min of Hynes ────────────────────────────────
 
-TIER1 = [
-    "back bay", "fenway", "kenmore", "south end", "prudential",
-    "copley", "hynes", "bay village",
+GREEN_LINE_STOPS = [
+    # Core (all branches)
+    ("Copley", 42.3500, -71.0773),
+    ("Hynes", 42.3479, -71.0840),
+    ("Kenmore", 42.3489, -71.0952),
+    # B Line
+    ("BU East", 42.3494, -71.1001),
+    ("BU Central", 42.3503, -71.1057),
+    ("BU West", 42.3510, -71.1083),
+    ("Babcock St", 42.3517, -71.1122),
+    ("Packards Corner", 42.3515, -71.1166),
+    ("Harvard Ave", 42.3503, -71.1313),
+    ("Griggs St", 42.3488, -71.1351),
+    # C Line
+    ("St Marys", 42.3457, -71.1068),
+    ("Hawes St", 42.3441, -71.1116),
+    ("Kent St", 42.3421, -71.1145),
+    ("Coolidge Corner", 42.3420, -71.1222),
+    ("Summit Ave", 42.3410, -71.1269),
+    ("Washington Sq", 42.3396, -71.1367),
+    # D Line
+    ("Fenway", 42.3453, -71.1040),
+    ("Longwood D", 42.3418, -71.1105),
+    ("Brookline Village", 42.3328, -71.1167),
+    ("Brookline Hills", 42.3314, -71.1267),
+    # E Line
+    ("Prudential", 42.3462, -71.0820),
+    ("Symphony", 42.3425, -71.0849),
+    ("Northeastern", 42.3395, -71.0888),
+    ("MFA", 42.3378, -71.0946),
+    ("Longwood Medical", 42.3371, -71.1005),
+    ("Brigham Circle", 42.3349, -71.1043),
 ]
-TIER2 = [
-    "brookline", "allston", "brighton", "longwood", "mission hill",
-    "jamaica plain", "symphony", "roxbury crossing", "northeastern",
-    "coolidge corner", "washington square", "cleveland circle",
-    "chestnut hill",
-]
-TIER3 = [
-    "cambridge", "somerville", "porter", "harvard", "central sq",
-    "central square", "davis", "downtown", "dorchester", "charlestown",
-    "medford", "kendall", "inman",
-]
+
+# ── Keywords ────────────────────────────────────────────────────────────────
 
 LAUNDRY_KEYWORDS = [
     "laundry", "w/d", "washer", "dryer", "in-unit", "in unit",
@@ -63,13 +88,22 @@ PET_POSITIVE = [
     "pet friendly", "pet-friendly", "pets ok", "pets allowed",
     "cats welcome", "pets welcome", "small pets",
 ]
-PET_NEGATIVE = ["no pets", "no cats", "no animals", "no pet policy", "no pet"]
+PET_NEGATIVE = [
+    "no pets", "no cats", "no animals", "no pet policy", "no pet",
+]
+RED_FLAG_KEYWORDS = [
+    ("garden level", "Garden/basement level"),
+    ("basement", "Garden/basement level"),
+    ("lower level", "Garden/basement level"),
+    ("no living room", "No living room"),
+    ("no lr", "No living room"),
+    ("no separate living", "No living room"),
+]
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────
 
 def haversine(lat1, lon1, lat2, lon2):
-    """Distance in miles between two coordinates."""
     R = 3959
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -80,6 +114,15 @@ def haversine(lat1, lon1, lat2, lon2):
         * math.sin(dlon / 2) ** 2
     )
     return R * 2 * math.asin(math.sqrt(a))
+
+
+def nearest_green_line_stop(lat, lon):
+    best_dist, best_name = 999, None
+    for name, slat, slon in GREEN_LINE_STOPS:
+        d = haversine(lat, lon, slat, slon)
+        if d < best_dist:
+            best_dist, best_name = d, name
+    return best_name, best_dist
 
 
 def load_state():
@@ -101,35 +144,12 @@ def save_state(seen):
         json.dump(pruned, f, indent=2)
 
 
-def should_run_zillow():
-    if not SEARCHAPI_KEY:
-        return False
-    if not ZILLOW_LAST_RUN_FILE.exists():
-        return True
-    try:
-        with open(ZILLOW_LAST_RUN_FILE) as f:
-            last_run = float(f.read().strip())
-        return (time.time() - last_run) >= ZILLOW_INTERVAL_HOURS * 3600
-    except (ValueError, OSError):
-        return True
-
-
-def mark_zillow_run():
-    STATE_DIR.mkdir(exist_ok=True)
-    with open(ZILLOW_LAST_RUN_FILE, "w") as f:
-        f.write(str(time.time()))
-
-
-def extract_neighborhood(title):
-    """Extract neighborhood from CL title: '$2100 / 1br - apt (Back Bay)'."""
-    match = re.search(r"\(([^)]+)\)\s*$", title)
-    return match.group(1) if match else ""
-
-
 def strip_html(text):
     text = re.sub(r"<[^>]+>", " ", text)
     return unescape(text).strip()
 
+
+# ── Craigslist ──────────────────────────────────────────────────────────────
 
 CL_HEADERS = {
     "User-Agent": (
@@ -146,39 +166,29 @@ def fetch_cl_detail(url):
         resp = requests.get(url, headers=CL_HEADERS, timeout=15)
         resp.raise_for_status()
         html = resp.text
-
         parts = []
-
-        # Posting body
         body_match = re.search(
             r'id="postingbody"[^>]*>(.*?)</section>', html, re.DOTALL
         )
         if body_match:
             parts.append(strip_html(body_match.group(1)))
-
-        # Attribute groups (structured: "laundry in bldg", "cats are OK", etc.)
         for attr in re.findall(r'class="attrgroup"[^>]*>(.*?)</p>', html, re.DOTALL):
             clean = strip_html(attr)
             if clean:
                 parts.append(clean)
-
         return " ".join(parts)
     except Exception as e:
         print(f"[CL] Detail fetch failed for {url}: {e}")
         return ""
 
 
-# ── Fetchers ────────────────────────────────────────────────────────────────
-
 def fetch_craigslist():
-    """Fetch CL listings by parsing the HTML search page + embedded JSON-LD."""
     listings = []
     try:
         resp = requests.get(CL_SEARCH_URL, headers=CL_HEADERS, timeout=30)
         resp.raise_for_status()
         html = resp.text
 
-        # Parse JSON-LD for lat/lon and structured data
         geo_data = {}
         ld_match = re.search(
             r'id="ld_searchpage_results"[^>]*>(.*?)</script>', html, re.DOTALL
@@ -192,10 +202,11 @@ def fetch_craigslist():
                     "lon": item.get("longitude"),
                     "beds": item.get("numberOfBedrooms"),
                     "baths": item.get("numberOfBathroomsTotal"),
-                    "locality": (item.get("address") or {}).get("addressLocality", ""),
+                    "locality": (item.get("address") or {}).get(
+                        "addressLocality", ""
+                    ),
                 }
 
-        # Parse HTML listing cards
         card_pattern = re.compile(
             r'<li\s+class="cl-static-search-result"[^>]*title="([^"]*)"[^>]*>\s*'
             r'<a\s+href="([^"]+)"[^>]*>.*?'
@@ -211,10 +222,11 @@ def fetch_craigslist():
             location = m.group(4).strip()
 
             price_match = re.search(r"\$([0-9,]+)", price_text)
-            price = int(price_match.group(1).replace(",", "")) if price_match else None
+            price = (
+                int(price_match.group(1).replace(",", "")) if price_match else None
+            )
 
             geo = geo_data.get(i, {})
-
             listing_id = re.search(r"/(\d+)\.html", link)
             lid = f"cl_{listing_id.group(1)}" if listing_id else f"cl_{link}"
 
@@ -227,11 +239,9 @@ def fetch_craigslist():
                 "price": price,
                 "beds": geo.get("beds"),
                 "baths": geo.get("baths"),
-                "sqft": None,
                 "link": link,
                 "lat": geo.get("lat"),
                 "lon": geo.get("lon"),
-                "thumbnail": None,
             })
 
     except Exception as e:
@@ -241,9 +251,24 @@ def fetch_craigslist():
     return listings
 
 
+# ── Zillow (disabled by default) ───────────────────────────────────────────
+
+def should_run_zillow():
+    if not ENABLE_ZILLOW or not SEARCHAPI_KEY:
+        return False
+    if not ZILLOW_LAST_RUN_FILE.exists():
+        return True
+    try:
+        with open(ZILLOW_LAST_RUN_FILE) as f:
+            last_run = float(f.read().strip())
+        return (time.time() - last_run) >= ZILLOW_INTERVAL_HOURS * 3600
+    except (ValueError, OSError):
+        return True
+
+
 def fetch_zillow():
     if not should_run_zillow():
-        print("[Zillow] Skipping (interval not reached)")
+        print("[Zillow] Disabled or interval not reached")
         return []
 
     listings = []
@@ -272,8 +297,6 @@ def fetch_zillow():
         for prop in data.get("properties", []):
             zpid = prop.get("zpid", "")
             price = prop.get("extracted_price") or prop.get("min_base_rent")
-
-            # Build description from tags for keyword scoring
             tag_texts = []
             if prop.get("tag"):
                 tag_texts.append(prop["tag"].get("text", ""))
@@ -282,7 +305,6 @@ def fetch_zillow():
             description = " ".join(
                 filter(None, [prop.get("status_text", "")] + tag_texts)
             )
-
             listings.append({
                 "id": f"zillow_{zpid}",
                 "source": "zillow",
@@ -292,16 +314,14 @@ def fetch_zillow():
                 "price": price,
                 "beds": prop.get("beds"),
                 "baths": prop.get("baths"),
-                "sqft": prop.get("sqft"),
                 "link": prop.get("link", ""),
                 "lat": prop.get("latitude"),
                 "lon": prop.get("longitude"),
-                "thumbnail": prop.get("thumbnail"),
-                "building_name": prop.get("building_name"),
-                "days_on_zillow": prop.get("days_on_zillow"),
             })
 
-        mark_zillow_run()
+        STATE_DIR.mkdir(exist_ok=True)
+        with open(ZILLOW_LAST_RUN_FILE, "w") as f:
+            f.write(str(time.time()))
         print(f"[Zillow] Fetched {len(listings)} listings")
 
     except Exception as e:
@@ -310,98 +330,86 @@ def fetch_zillow():
     return listings
 
 
-# ── Scoring ─────────────────────────────────────────────────────────────────
+# ── Filter ──────────────────────────────────────────────────────────────────
 
-def score_listing(listing):
-    """Returns (score, classification, reasons)."""
-    score = 0
-    reasons = []
+def check_listing(listing):
+    """Pass/fail filter. Returns (pass, location_info, red_flags) or (False, ..., ...)."""
     text = f"{listing['title']} {listing['description']} {listing['neighborhood']}".lower()
 
-    # --- Hard filters (instant SKIP) ---
+    # Must have coordinates for geo filtering
+    if not listing.get("lat") or not listing.get("lon"):
+        return False, "", []
+
+    # ── Hard exclusions ──
+
+    # No studios
     beds = listing.get("beds")
     if beds is not None and beds < 1:
-        return 0, "SKIP", ["Studio"]
+        return False, "", []
     if any(kw in text for kw in ["studio", "0br"]):
-        return 0, "SKIP", ["Studio"]
-    if any(kw in text for kw in ["sublet", "sub-let", "sublease", "sub-lease",
-                                    "short term", "short-term", "temporary"]):
-        return 0, "SKIP", ["Sublet"]
-    # Detect date-range sublets like "June 1st - August 30th"
-    if re.search(r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+\S*\s*[-–—]\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+", text):
-        return 0, "SKIP", ["Date-range sublet"]
+        return False, "", []
 
-    # --- Location ---
-    geo_scored = False
-    if listing.get("lat") and listing.get("lon"):
-        dist = haversine(TARGET_LAT, TARGET_LON, listing["lat"], listing["lon"])
-        geo_scored = True
-        if dist <= 0.5:
-            score += 30
-            reasons.append(f"{dist:.1f} mi — walking distance")
-        elif dist <= 1.0:
-            score += 25
-            reasons.append(f"{dist:.1f} mi — close")
-        elif dist <= 2.0:
-            score += 15
-            reasons.append(f"{dist:.1f} mi — nearby")
-        elif dist <= 5.0:
-            score += 5
-            reasons.append(f"{dist:.1f} mi — moderate distance")
-        else:
-            reasons.append(f"{dist:.1f} mi — far")
+    # No sublets
+    if any(kw in text for kw in [
+        "sublet", "sub-let", "sublease", "sub-lease",
+        "short term", "short-term", "temporary",
+    ]):
+        return False, "", []
+    if re.search(
+        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+\S*"
+        r"\s*[-\u2013\u2014]\s*"
+        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+",
+        text,
+    ):
+        return False, "", []
 
-    if not geo_scored:
-        matched_tier = False
-        for tier_kws, tier_score, tier_label in [
-            (TIER1, 25, "Tier 1 — walking distance"),
-            (TIER2, 15, "Tier 2 — Green Line"),
-            (TIER3, 10, "Tier 3 — Red Line area"),
-        ]:
-            if any(kw in text for kw in tier_kws):
-                score += tier_score
-                reasons.append(tier_label)
-                matched_tier = True
-                break
-        if not matched_tier:
-            reasons.append("Unknown neighborhood")
+    # No explicit pet bans (unless cats specifically allowed)
+    has_pet_pos = any(kw in text for kw in PET_POSITIVE)
+    has_pet_neg = any(kw in text for kw in PET_NEGATIVE)
+    if has_pet_neg and not has_pet_pos:
+        return False, "", []
 
-    # --- Laundry ---
-    if any(kw in text for kw in LAUNDRY_KEYWORDS):
-        score += 15
-        reasons.append("Laundry mentioned")
+    # Must mention laundry
+    if not any(kw in text for kw in LAUNDRY_KEYWORDS):
+        return False, "", []
 
-    # --- Pets ---
-    has_pet_positive = any(kw in text for kw in PET_POSITIVE)
-    has_pet_negative = any(kw in text for kw in PET_NEGATIVE)
-    if has_pet_positive:
-        score += 10
-        reasons.append("Cat/pet friendly")
-    elif has_pet_negative:
-        score -= 20
-        reasons.append("No pets allowed")
+    # ── Location: walking distance OR near a Green Line stop ──
 
-    # --- Classify ---
-    # "Cats OK" overrides a generic "No Pets" in the same listing
-    definitively_no_pets = has_pet_negative and not has_pet_positive
-    if score >= 40 and not definitively_no_pets:
-        classification = "HOT"
-    elif score >= 25:
-        classification = "GOOD"
-    elif score >= 10:
-        classification = "MATCH"
+    dist_work = haversine(TARGET_LAT, TARGET_LON, listing["lat"], listing["lon"])
+    stop_name, stop_dist = nearest_green_line_stop(listing["lat"], listing["lon"])
+
+    walking = dist_work <= WALK_DISTANCE_MI
+    near_green = stop_dist <= STOP_RADIUS_MI
+
+    if not walking and not near_green:
+        return False, "", []
+
+    if walking:
+        location_info = f"{dist_work:.1f} mi to work (walking distance)"
     else:
-        classification = "SKIP"
+        location_info = f"{dist_work:.1f} mi to work | {stop_dist:.1f} mi to {stop_name}"
 
-    return score, classification, reasons
+    # ── Red flags (auto-exclude) ──
+
+    red_flags = []
+    seen_flags = set()
+    for keyword, flag_label in RED_FLAG_KEYWORDS:
+        if keyword in text and flag_label not in seen_flags:
+            red_flags.append(flag_label)
+            seen_flags.add(flag_label)
+
+    if red_flags:
+        return False, location_info, red_flags
+
+    return True, location_info, []
 
 
 # ── Notifications ───────────────────────────────────────────────────────────
 
 def _tg_request(method, payload):
-    """Make a Telegram Bot API request."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TG] Not configured — would send: {payload.get('text', payload.get('caption', ''))[:120]}...")
+        print(f"[TG] Not configured — would send: "
+              f"{payload.get('text', payload.get('caption', ''))[:120]}...")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
@@ -412,101 +420,26 @@ def _tg_request(method, payload):
         print(f"[TG] Send failed: {e}")
 
 
-def _format_listing_line(listing, score, classification):
-    """One-line summary for grouped messages."""
-    price = f"${listing['price']:,}" if listing.get("price") else "?"
-    beds = f"{listing['beds']}BR" if listing.get("beds") else ""
-    label = listing["title"][:55]
-    icon = "+" if classification == "GOOD" else "-"
-    return f"  {icon} {price} {beds} — {label}"
-
-
-def notify_hot(listing, score, reasons):
-    """Individual Telegram message for a HOT match."""
+def notify_match(listing, location_info):
     price_str = f"${listing['price']:,}/mo" if listing.get("price") else "Price N/A"
     beds_str = f"{listing['beds']}BR" if listing.get("beds") else ""
     baths_str = f" / {listing['baths']}BA" if listing.get("baths") else ""
-    sqft_str = f" / {listing['sqft']} sqft" if listing.get("sqft") else ""
 
     text = (
-        f"<b>HOT MATCH</b> (score {score})\n\n"
+        f"<b>New Match</b>\n\n"
         f"<b>{listing['title']}</b>\n"
-        f"{price_str}  {beds_str}{baths_str}{sqft_str}\n\n"
-        + "\n".join(f"  - {r}" for r in reasons)
-        + f"\n\n<a href=\"{listing['link']}\">View Listing</a>"
-        f"  ({listing['source'].title()})"
+        f"{price_str}  {beds_str}{baths_str}\n"
+        f"{location_info}\n\n"
+        f"<a href=\"{listing['link']}\">View Listing</a>"
     )
 
-    if listing.get("thumbnail"):
-        _tg_request("sendPhoto", {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "photo": listing["thumbnail"],
-            "caption": text,
-            "parse_mode": "HTML",
-        })
-    else:
-        _tg_request("sendMessage", {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        })
+    _tg_request("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    })
     time.sleep(1)
-
-
-def notify_summary(matches):
-    """Grouped Telegram summary for GOOD + MATCH listings."""
-    if not matches:
-        return
-
-    lines = [f"<b>{len(matches)} New Listings</b>\n"]
-
-    for listing, score, classification, reasons in matches:
-        price = f"${listing['price']:,}" if listing.get("price") else "?"
-        beds = f"{listing['beds']}BR" if listing.get("beds") else ""
-        icon = "[GOOD]" if classification == "GOOD" else "[MATCH]"
-
-        lines.append(
-            f"<b>{icon}</b> {price} {beds} — {listing['title'][:60]}\n"
-            f"  {' | '.join(reasons)}\n"
-            f"  <a href=\"{listing['link']}\">View</a> ({listing['source']})\n"
-        )
-
-    message = "\n".join(lines)
-
-    # Telegram 4096 char limit — split if needed
-    if len(message) <= 4000:
-        _tg_request("sendMessage", {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        })
-        return
-
-    chunk_lines = []
-    chunk_len = 0
-    for line in lines:
-        if chunk_len + len(line) > 3800 and chunk_lines:
-            _tg_request("sendMessage", {
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": "\n".join(chunk_lines),
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            })
-            time.sleep(1)
-            chunk_lines = []
-            chunk_len = 0
-        chunk_lines.append(line)
-        chunk_len += len(line)
-
-    if chunk_lines:
-        _tg_request("sendMessage", {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": "\n".join(chunk_lines),
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        })
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -525,51 +458,48 @@ def main():
     new_listings = [l for l in all_listings if l["id"] not in seen]
     print(f"New: {len(new_listings)} of {len(all_listings)} total")
 
-    # First pass: score with title/location only
-    # Second pass: enrich promising CL listings with full description, re-score
-    ENRICH_THRESHOLD = 20  # score needed to warrant fetching detail page
-    enriched = 0
+    # Quick location pre-check to decide which listings to enrich
+    to_enrich = []
     for listing in new_listings:
-        score, _, _ = score_listing(listing)
-        if (
-            score >= ENRICH_THRESHOLD
-            and listing["source"] == "craigslist"
-            and listing.get("link")
-        ):
+        if not listing.get("lat") or not listing.get("lon"):
+            continue
+        dist_work = haversine(TARGET_LAT, TARGET_LON, listing["lat"], listing["lon"])
+        _, stop_dist = nearest_green_line_stop(listing["lat"], listing["lon"])
+        if dist_work <= WALK_DISTANCE_MI or stop_dist <= STOP_RADIUS_MI:
+            to_enrich.append(listing)
+
+    # Enrich with full CL descriptions
+    enriched = 0
+    for listing in to_enrich:
+        if listing["source"] == "craigslist" and listing.get("link"):
             detail = fetch_cl_detail(listing["link"])
             if detail:
                 listing["description"] = f"{listing['description']} {detail}"
                 enriched += 1
-                time.sleep(1)  # respect CL rate limits
+                time.sleep(1)
     if enriched:
         print(f"[CL] Enriched {enriched} listings with full descriptions")
 
-    # Final scoring with enriched data
-    hot = []
-    other = []
-
+    # Filter
+    matches = []
     for listing in new_listings:
-        score, classification, reasons = score_listing(listing)
         seen[listing["id"]] = now.timestamp()
+        passed, location_info, red_flags = check_listing(listing)
+        if passed:
+            matches.append((listing, location_info))
+            print(f"  MATCH: {listing['title'][:65]}")
+        elif red_flags:
+            print(f"  SKIP (red flag: {', '.join(red_flags)}): {listing['title'][:50]}")
 
-        if classification == "HOT":
-            hot.append((listing, score, classification, reasons))
-            print(f"  HOT  ({score}): {listing['title'][:70]}")
-        elif classification in ("GOOD", "MATCH"):
-            other.append((listing, score, classification, reasons))
-            print(f"  {classification:5} ({score}): {listing['title'][:70]}")
-
-    print(f"Results: {len(hot)} HOT, {len(other)} GOOD/MATCH, "
-          f"{len(new_listings) - len(hot) - len(other)} skipped")
+    print(f"Results: {len(matches)} matches of {len(new_listings)} new listings")
 
     # Notify
-    for listing, score, classification, reasons in hot:
-        notify_hot(listing, score, reasons)
+    for listing, location_info in matches:
+        notify_match(listing, location_info)
 
-    if not hot:
-        print("No HOT matches — no notifications sent.")
+    if not matches:
+        print("No matches — no notifications sent.")
 
-    # Persist
     save_state(seen)
     print("Done.")
 
