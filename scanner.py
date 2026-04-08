@@ -63,7 +63,7 @@ PET_POSITIVE = [
     "pet friendly", "pet-friendly", "pets ok", "pets allowed",
     "cats welcome", "pets welcome", "small pets",
 ]
-PET_NEGATIVE = ["no pets", "no cats", "no animals"]
+PET_NEGATIVE = ["no pets", "no cats", "no animals", "no pet policy", "no pet"]
 
 
 # ── Utilities ───────────────────────────────────────────────────────────────
@@ -317,6 +317,19 @@ def score_listing(listing):
     score = 0
     reasons = []
     text = f"{listing['title']} {listing['description']} {listing['neighborhood']}".lower()
+
+    # --- Hard filters (instant SKIP) ---
+    beds = listing.get("beds")
+    if beds is not None and beds < 1:
+        return 0, "SKIP", ["Studio"]
+    if any(kw in text for kw in ["studio", "0br"]):
+        return 0, "SKIP", ["Studio"]
+    if any(kw in text for kw in ["sublet", "sub-let", "sublease", "sub-lease",
+                                    "short term", "short-term", "temporary"]):
+        return 0, "SKIP", ["Sublet"]
+    # Detect date-range sublets like "June 1st - August 30th"
+    if re.search(r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+\S*\s*[-–—]\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+\d+", text):
+        return 0, "SKIP", ["Date-range sublet"]
 
     # --- Location ---
     geo_scored = False
