@@ -131,23 +131,50 @@ def strip_html(text):
     return unescape(text).strip()
 
 
+CL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def fetch_cl_detail(url):
+    """Fetch full description + attributes from a CL listing page."""
+    try:
+        resp = requests.get(url, headers=CL_HEADERS, timeout=15)
+        resp.raise_for_status()
+        html = resp.text
+
+        parts = []
+
+        # Posting body
+        body_match = re.search(
+            r'id="postingbody"[^>]*>(.*?)</section>', html, re.DOTALL
+        )
+        if body_match:
+            parts.append(strip_html(body_match.group(1)))
+
+        # Attribute groups (structured: "laundry in bldg", "cats are OK", etc.)
+        for attr in re.findall(r'class="attrgroup"[^>]*>(.*?)</p>', html, re.DOTALL):
+            clean = strip_html(attr)
+            if clean:
+                parts.append(clean)
+
+        return " ".join(parts)
+    except Exception as e:
+        print(f"[CL] Detail fetch failed for {url}: {e}")
+        return ""
+
+
 # ── Fetchers ────────────────────────────────────────────────────────────────
 
 def fetch_craigslist():
     """Fetch CL listings by parsing the HTML search page + embedded JSON-LD."""
     listings = []
     try:
-        resp = requests.get(
-            CL_SEARCH_URL,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-            },
-            timeout=30,
-        )
+        resp = requests.get(CL_SEARCH_URL, headers=CL_HEADERS, timeout=30)
         resp.raise_for_status()
         html = resp.text
 
@@ -485,7 +512,26 @@ def main():
     new_listings = [l for l in all_listings if l["id"] not in seen]
     print(f"New: {len(new_listings)} of {len(all_listings)} total")
 
-    # Score
+    # First pass: score with title/location only
+    # Second pass: enrich promising CL listings with full description, re-score
+    ENRICH_THRESHOLD = 20  # score needed to warrant fetching detail page
+    enriched = 0
+    for listing in new_listings:
+        score, _, _ = score_listing(listing)
+        if (
+            score >= ENRICH_THRESHOLD
+            and listing["source"] == "craigslist"
+            and listing.get("link")
+        ):
+            detail = fetch_cl_detail(listing["link"])
+            if detail:
+                listing["description"] = f"{listing['description']} {detail}"
+                enriched += 1
+                time.sleep(1)  # respect CL rate limits
+    if enriched:
+        print(f"[CL] Enriched {enriched} listings with full descriptions")
+
+    # Final scoring with enriched data
     hot = []
     other = []
 
